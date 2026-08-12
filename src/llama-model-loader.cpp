@@ -19,6 +19,56 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+// Ollama exports gpt-oss GGUFs with general.architecture = "gptoss" (no
+// hyphen) and every per-arch hparam key prefixed the same way, while this
+// codebase's arch name/keys use "gpt-oss" (LLM_ARCH_OPENAI_MOE, see
+// llama-arch.cpp). Ollama's own bundled llama-server carries a private
+// patch for this (its startup log calls it "handle_gptoss"); this fork
+// doesn't, so do the same key copy here before anything reads the GGUF:
+// rename the architecture string and duplicate every "gptoss.*" key under
+// "gpt-oss.*". Two keys llama.cpp needs aren't in this GGUF format at all
+// (expert_feed_forward_length, rope.scaling.type) -- rope.scaling.type in
+// particular is GGML_ASSERT'd present in llama-model.cpp, not just
+// defaulted, so a missing key there aborts the whole process, not just
+// this one hparam. Values here match what Ollama's own compat step fills
+// in for this model (confirmed against its live server log).
+static void llama_model_loader_fixup_ollama_gptoss_gguf(struct gguf_context * ctx) {
+    const int64_t arch_kid = gguf_find_key(ctx, "general.architecture");
+    if (arch_kid < 0 || std::string(gguf_get_val_str(ctx, arch_kid)) != "gptoss") {
+        return;
+    }
+    gguf_set_val_str(ctx, "general.architecture", "gpt-oss");
+
+    static const char * u32_keys[] = {
+        "attention.head_count", "attention.head_count_kv", "attention.key_length",
+        "attention.sliding_window", "attention.value_length", "block_count",
+        "context_length", "embedding_length", "expert_count", "expert_used_count",
+        "feed_forward_length", "rope.scaling.original_context_length",
+    };
+    for (const char * suffix : u32_keys) {
+        const int64_t kid = gguf_find_key(ctx, (std::string("gptoss.") + suffix).c_str());
+        if (kid >= 0) {
+            gguf_set_val_u32(ctx, (std::string("gpt-oss.") + suffix).c_str(), gguf_get_val_u32(ctx, kid));
+        }
+    }
+
+    static const char * f32_keys[] = {
+        "attention.layer_norm_rms_epsilon", "rope.freq_base", "rope.scaling.factor",
+    };
+    for (const char * suffix : f32_keys) {
+        const int64_t kid = gguf_find_key(ctx, (std::string("gptoss.") + suffix).c_str());
+        if (kid >= 0) {
+            gguf_set_val_f32(ctx, (std::string("gpt-oss.") + suffix).c_str(), gguf_get_val_f32(ctx, kid));
+        }
+    }
+
+    const int64_t ffn_kid = gguf_find_key(ctx, "gpt-oss.feed_forward_length");
+    if (ffn_kid >= 0) {
+        gguf_set_val_u32(ctx, "gpt-oss.expert_feed_forward_length", gguf_get_val_u32(ctx, ffn_kid));
+    }
+    gguf_set_val_str(ctx, "gpt-oss.rope.scaling.type", "yarn");
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -561,6 +611,7 @@ llama_model_loader::llama_model_loader(
         if (metadata == nullptr) {
             throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
         }
+        llama_model_loader_fixup_ollama_gptoss_gguf(metadata);
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
@@ -673,6 +724,7 @@ llama_model_loader::llama_model_loader(
         if (metadata == nullptr) {
             throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
         }
+        llama_model_loader_fixup_ollama_gptoss_gguf(metadata);
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
@@ -698,6 +750,54 @@ llama_model_loader::llama_model_loader(
 
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
+
+    // Same Ollama-format-gpt-oss story as llama_model_loader_fixup_ollama_
+    // gptoss_gguf above, but for tensor names instead of metadata keys:
+    // Ollama's GGUF uses "ffn_norm"/"attn_out" (the short names most other
+    // 2-norm-per-layer architectures use), while this fork's openai-moe.cpp
+    // asks for "post_attention_norm"/"attn_output" (the official
+    // ggml-org/gpt-oss-*-GGUF tensor layout instead). Alias each by adding
+    // a second weights_map entry pointing at the same llama_tensor_weight --
+    // cheap (this only copies the lookup entry, not tensor data) and safe:
+    // get_weight()/get_tensor_meta() key off this map's string alone, never
+    // off the underlying ggml_tensor's own ->name.
+    {
+        static const std::pair<std::string, std::string> renames[] = {
+            {".ffn_norm.",  ".post_attention_norm."},
+            {".attn_out.",  ".attn_output."},
+        };
+        std::vector<std::pair<std::string, llama_tensor_weight>> gptoss_aliases;
+        for (const auto & it : weights_map) {
+            const std::string & name = it.first;
+            for (const auto & rn : renames) {
+                const std::string & from = rn.first;
+                const size_t pos = name.rfind(from);
+                if (pos == std::string::npos) {
+                    continue;
+                }
+                const std::string alias = name.substr(0, pos) + rn.second + name.substr(pos + from.size());
+                if (weights_map.find(alias) == weights_map.end()) {
+                    gptoss_aliases.emplace_back(alias, it.second);
+                }
+                break;
+            }
+
+            // "attn_sinks" is the only tensor Ollama's GGUF stores without a
+            // ".weight" suffix at all -- every other tensor here (including
+            // the ones renamed above) keeps it.
+            static const std::string sinks_suffix = ".attn_sinks";
+            if (name.size() > sinks_suffix.size() &&
+                name.compare(name.size() - sinks_suffix.size(), sinks_suffix.size(), sinks_suffix) == 0) {
+                const std::string alias = name + ".weight";
+                if (weights_map.find(alias) == weights_map.end()) {
+                    gptoss_aliases.emplace_back(alias, it.second);
+                }
+            }
+        }
+        for (auto & kv : gptoss_aliases) {
+            weights_map.emplace(kv.first, kv.second);
+        }
+    }
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 
