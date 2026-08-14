@@ -1,5 +1,29 @@
 # llama.cpp
 
+> **This is flowAI's fork** (git@github.com:IlyaFeoktistov/llama.cpp.git,
+> branch `flowai-expert-streaming`) of upstream ggml-org/llama.cpp, used by
+> flowAI's experimental `expert_streaming.py` backend (see that file's
+> docstring for what it is and why). This branch adds, as real commits on
+> top of upstream:
+>
+> - Community PR #26824 ("Expert Caching") head commit -- real per-token
+>   dynamic hot/cold expert caching for MoE models, closed unmerged upstream
+>   for process reasons, not because it doesn't work.
+> - `gpt-oss`/Ollama GGUF compat: Ollama exports gpt-oss GGUFs with
+>   different arch/key/tensor names than this codebase expects -- aliased
+>   at load time (`src/llama-model-loader.cpp`).
+> - `GLM-4.7-Flash`/Ollama GGUF compat: Ollama exports this model as
+>   `general.architecture = "glm4moelite"`, an arch neither upstream nor
+>   this fork has native code for (ggml-org/llama.cpp#18931, open). Aliased
+>   to `LLM_ARCH_DEEPSEEK2`'s MLA code path at load time, plus a real
+>   generation-doesn't-stop bug fix (the GGUF's `tokenizer.ggml.eos_token_ids`
+>   array was never read at all -- only its first entry ended up registered
+>   as an end-of-generation token). See `src/llama-model-loader.cpp`'s
+>   `llama_model_loader_fixup_ollama_glm4moelite_gguf()` for the full
+>   rationale, or this branch's commit history for the investigation trail.
+>
+> Nothing below this point is flowAI-specific -- it's upstream's own README.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
