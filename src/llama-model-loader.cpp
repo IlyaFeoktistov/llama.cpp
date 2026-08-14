@@ -69,6 +69,87 @@ static void llama_model_loader_fixup_ollama_gptoss_gguf(struct gguf_context * ct
     gguf_set_val_str(ctx, "gpt-oss.rope.scaling.type", "yarn");
 }
 
+// Ollama exports GLM-4.7-Flash GGUFs with general.architecture = "glm4moelite",
+// an arch this fork (and upstream, as of ggml-org/llama.cpp#18931) has no
+// native code for at all -- it fails to load with "unknown model
+// architecture" otherwise. Its tensor layout and hparams are already an
+// exact match for LLM_ARCH_DEEPSEEK2's MLA code path (confirmed by direct
+// inspection of all 844 tensor names), so alias it there instead of writing
+// a new arch class: rename the architecture string and duplicate every
+// "glm4moelite.*" key under "deepseek2.*", same technique as the gptoss
+// fixup above.
+//
+// Two of those keys need more than a straight rename:
+// - attention.key_length/key_length_mla and value_length/value_length_mla
+//   name the same two physical dimensions the OPPOSITE way round from what
+//   deepseek2.cpp expects: llama_hparams::n_embd_head_k_mla() reads the
+//   "_mla"-suffixed key as the small, MLA-compressed head dim, but in this
+//   GGUF the "_mla"-suffixed key holds the LARGER value (576/512) and the
+//   unsuffixed key holds the smaller one (256/256) -- swap them. Confirmed
+//   empirically: without the swap, check_tensor_dims fails on attn_q_b
+//   ("expected 768,11520, got 768,5120").
+// - attention.head_count_kv is exported here equal to attention.head_count
+//   (20), the real pre-MLA-absorption head count -- but hparams.n_embd_k_gqa(),
+//   which sizes the KV-cache tensor, multiplies head_count_kv in directly
+//   and isn't MLA-aware, while the actual MLA graph always writes a single
+//   MQA-style compressed row per token regardless of head_count. Force it to
+//   1, matching what convert_hf_to_gguf.py's own DeepseekV2Model always sets
+//   for every real (non-OCR) deepseek2 GGUF ("deepseek2 using MLA converts
+//   into MQA, ie: GQA with 1 group"). Without this, cache alloc size
+//   (n_embd_head_k * head_count_kv) doesn't match the runtime
+//   kv_lora_rank+rope width, and ggml_set_rows asserts in build_attn.
+static void llama_model_loader_fixup_ollama_glm4moelite_gguf(struct gguf_context * ctx) {
+    const int64_t arch_kid = gguf_find_key(ctx, "general.architecture");
+    if (arch_kid < 0 || std::string(gguf_get_val_str(ctx, arch_kid)) != "glm4moelite") {
+        return;
+    }
+    gguf_set_val_str(ctx, "general.architecture", "deepseek2");
+
+    static const char * u32_keys[] = {
+        "attention.head_count", "attention.kv_lora_rank", "attention.q_lora_rank",
+        "block_count", "context_length", "embedding_length", "expert_count",
+        "expert_feed_forward_length", "expert_gating_func", "expert_shared_count",
+        "expert_used_count", "feed_forward_length", "leading_dense_block_count",
+        "rope.dimension_count",
+    };
+    for (const char * suffix : u32_keys) {
+        const int64_t kid = gguf_find_key(ctx, (std::string("glm4moelite.") + suffix).c_str());
+        if (kid >= 0) {
+            gguf_set_val_u32(ctx, (std::string("deepseek2.") + suffix).c_str(), gguf_get_val_u32(ctx, kid));
+        }
+    }
+
+    static const char * f32_keys[] = {
+        "attention.layer_norm_rms_epsilon", "expert_weights_scale", "rope.freq_base",
+    };
+    for (const char * suffix : f32_keys) {
+        const int64_t kid = gguf_find_key(ctx, (std::string("glm4moelite.") + suffix).c_str());
+        if (kid >= 0) {
+            gguf_set_val_f32(ctx, (std::string("deepseek2.") + suffix).c_str(), gguf_get_val_f32(ctx, kid));
+        }
+    }
+
+    const int64_t norm_kid = gguf_find_key(ctx, "glm4moelite.expert_weights_norm");
+    if (norm_kid >= 0) {
+        gguf_set_val_bool(ctx, "deepseek2.expert_weights_norm", gguf_get_val_bool(ctx, norm_kid));
+    }
+
+    static const std::pair<const char *, const char *> swap_pairs[] = {
+        {"attention.key_length",       "attention.key_length_mla"},
+        {"attention.key_length_mla",   "attention.key_length"},
+        {"attention.value_length",     "attention.value_length_mla"},
+        {"attention.value_length_mla", "attention.value_length"},
+    };
+    for (const auto & sp : swap_pairs) {
+        const int64_t kid = gguf_find_key(ctx, (std::string("glm4moelite.") + sp.first).c_str());
+        if (kid >= 0) {
+            gguf_set_val_u32(ctx, (std::string("deepseek2.") + sp.second).c_str(), gguf_get_val_u32(ctx, kid));
+        }
+    }
+
+    gguf_set_val_u32(ctx, "deepseek2.attention.head_count_kv", 1);
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -612,6 +693,7 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
         }
         llama_model_loader_fixup_ollama_gptoss_gguf(metadata);
+        llama_model_loader_fixup_ollama_glm4moelite_gguf(metadata);
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
@@ -725,6 +807,7 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
         }
         llama_model_loader_fixup_ollama_gptoss_gguf(metadata);
+        llama_model_loader_fixup_ollama_glm4moelite_gguf(metadata);
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
