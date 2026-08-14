@@ -148,6 +148,32 @@ static void llama_model_loader_fixup_ollama_glm4moelite_gguf(struct gguf_context
     }
 
     gguf_set_val_u32(ctx, "deepseek2.attention.head_count_kv", 1);
+
+    // Ollama's GGUF also carries a plural "tokenizer.ggml.eos_token_ids"
+    // array (here: [154820, 154827, 154829] = <|endoftext|>, <|user|>,
+    // <|observation|>) that llama-vocab.cpp has no code path for at all --
+    // it only ever reads the singular "tokenizer.ggml.eos_token_id", so only
+    // the first entry (<|endoftext|>, the true end-of-text token) ends up in
+    // special_eog_ids. <|user|> and <|observation|> are GLM's actual
+    // per-turn stop markers (what the model predicts to end an assistant
+    // turn or a tool-call turn) -- without them registered, generation runs
+    // straight past where a turn should end and free-runs into hallucinated
+    // follow-up turns. llama-vocab.cpp already folds "tokenizer.ggml.
+    // eot_token_id" and "tokenizer.ggml.eom_token_id" into special_eog_ids
+    // (see llama-vocab.cpp's special_eot_id/special_eom_id handling) but
+    // this GGUF leaves both unset -- fill them from the 2nd/3rd array
+    // entries instead of leaving them to whatever each key's own
+    // architecture-specific default would otherwise be.
+    const int64_t eos_ids_kid = gguf_find_key(ctx, "tokenizer.ggml.eos_token_ids");
+    if (eos_ids_kid >= 0 && gguf_get_arr_type(ctx, eos_ids_kid) == GGUF_TYPE_INT32 && gguf_get_arr_n(ctx, eos_ids_kid) >= 3) {
+        const int32_t * eos_ids = (const int32_t *) gguf_get_arr_data(ctx, eos_ids_kid);
+        if (gguf_find_key(ctx, "tokenizer.ggml.eot_token_id") < 0) {
+            gguf_set_val_u32(ctx, "tokenizer.ggml.eot_token_id", (uint32_t) eos_ids[1]);
+        }
+        if (gguf_find_key(ctx, "tokenizer.ggml.eom_token_id") < 0) {
+            gguf_set_val_u32(ctx, "tokenizer.ggml.eom_token_id", (uint32_t) eos_ids[2]);
+        }
+    }
 }
 
 const char * llama_file_version_name(llama_fver version) {
